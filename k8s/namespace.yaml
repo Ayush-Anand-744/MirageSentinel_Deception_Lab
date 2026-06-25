@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: miragesentinel-honeynet
+  labels:
+    app.kubernetes.io/part-of: miragesentinel-deception
+    purpose: honeypot-isolation

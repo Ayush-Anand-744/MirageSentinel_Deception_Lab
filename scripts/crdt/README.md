@@ -1,0 +1,257 @@
+
+To initialise the cargo (rust) for crdt:
+```bash
+cargo new mirage-crdt
+cd mirage-crdt
+```
+
+# Theory
+
+1. G-Set (Grow-Only Set)
+**Purpose:**
+Visited hosts, historical actions.
+
+**Merge rule:**
+Union.
+
+2. WOR-Set (Add-Wins Observed-Remove Set)
+**Purpose:**
+Stolen credentials.
+
+**You want:**
+- Credentials can be “replaced”
+- But concurrent adds should win over removes
+
+**AWOR-set needs:**
+- Unique tag per add
+- Tombstones for removes
+
+**Merge rule:**
+- Union adds
+- Union removes
+- Effective set = adds - removes
+
+
+3. LWW-Register
+**Purpose:**
+- Current attacker location.
+- Only one value matters.
+
+**Merge rule:**
+- Take value with higher timestamp.
+- Tie-break using node ID.
+
+
+4. LWW-Map
+**Purpose:**
+- Active sessions per host.
+
+**Merge rule:**
+- Per-key LWW resolution.
+
+
+## fake-jump-01 (SSH-based sync)
+*Behavior we emulate:*
+Jump hosts routinely SSH into internal web servers
+
+*Transport:*
+- CRDT state copied via scp
+- Merged locally
+- No listener
+- No open ports
+
+
+To make Static Binary:
+```bash
+rustup target add x86_64-unknown-linux-musl
+cargo build --release --target x86_64-unknown-linux-musl
+# or
+
+
+```
+
+Binary:
+```bash
+target/x86_64-unknown-linux-musl/release/mirage-crdt
+```
+
+Copy to jump (ssh) host:
+```bash
+scp mirage-crdt admin@10.20.20.10:/usr/local/bin/
+```
+
+Jump host wrapper (/usr/local/bin/ssh-audit):
+```bash
+#!/bin/sh
+LOG="/var/log/ssh_auth.log"
+
+tail -n 20 /var/log/auth.log | while read line; do
+  echo "$line" | /usr/local/bin/mirage-crdt observe
+done
+```
+
+### SSH Hook (Jump Host) 
+Attackers expect SSH hooks on jump hosts.
+
+*Where to hook:*
+/etc/profile
+/etc/profile.d/*.sh
+/etc/ssh/sshrc
+ForceCommand (selective)
+
+ 
+/etc/profile.d/10-sys-audit.sh
+```bash
+#!/bin/sh
+
+# Only run for real shells
+[ -z "$SSH_CONNECTION" ] && return
+
+# Randomize execution
+[ $((RANDOM % 5)) -ne 0 ] && return
+
+/usr/local/bin/mirage-crdt sync >/dev/null 2>&1 &
+```
+
+*Why this works:*
+- Runs only on SSH login
+- Randomized
+- Looks like audit tooling
+- No cron
+- No timers
+- No persistent process
+ 
+
+## fake-web-02 (HTTP-based sync)
+*Behavior we emulate:*
+Web servers pulling config / telemetry from peers
+
+*Transport:*
+- HTTP GET on localhost-like endpoint
+- Piggybacks nginx
+
+
+Add fake internal endpoint
+```bash
+mkdir -p /var/www/internal
+```
+Expose via nginx (NOT public):
+```nginx
+location /internal/status {
+    allow 10.20.20.0/24;
+    deny all;
+    root /var/www;
+}
+```
+
+CRDT exporter
+```bash
+/usr/local/bin/mirage-crdt export > /var/www/internal/status/state.json
+```
+
+### Nginx Worker Piggyback
+Instead of cron, tie sync to web traffic.
+Logrotate hook
+
+Edit:
+```bash
+sudo nano /etc/logrotate.d/nginx
+```
+
+Add:
+```conf
+postrotate
+    /usr/local/bin/mirage-crdt sync >/dev/null 2>&1 &
+endscript
+```
+
+*Why this works:*
+- Logrotate is expected
+- Attackers almost never flag postrotate hooks
+- Timing matches real infra behavior
+- No persistent footprint
+
+
+## Package Manager Hook (Extremely Realistic)
+Many enterprises run apt/yum hooks.
+
+Debian-based (fake-web-02)
+
+Create:
+```bash
+/etc/apt/apt.conf.d/99sys-telemetry
+```
+
+```
+DPkg::Post-Invoke {
+  "/usr/local/bin/mirage-crdt sync >/dev/null 2>&1 || true";
+};
+```
+
+*Why this works:*
+- Totally normal
+- Triggered irregularly
+- Looks like telemetry/compliance
+- No scheduling artifact
+
+
+# Making binary:
+
+
+### Dynamic
+```bash
+cargo build --release
+
+ls -lh target/release/
+
+cp target/release/mirage-crdt target/release/syslogd-helper
+
+sudo ./target/release/syslogd-helper observe 1.2.3.4
+
+sudo ls -la /var/lib | grep syscache
+
+sudo cat /var/lib/.syscache
+```
+
+### Static
+
+```bash
+sudo apt install musl-tools
+
+rustup target add x86_64-unknown-linux-musl
+
+cargo clean
+
+cargo build --release --target x86_64-unknown-linux-musl
+
+# Verify
+file target/x86_64-unknown-linux-musl/release/mirage-crdt
+```
+
+
+
+# Mergeing
+
+## Manual
+```bash
+scp admin@10.20.20.20:/var/lib/.syscache /tmp/redis.state
+scp /tmp/redis.state admin@10.20.20.10:/tmp/redis.state
+
+
+ssh admin@10.20.20.10
+sudo /usr/local/bin/syslogd-helper merge /tmp/redis.state
+
+# or inside vm:
+sudo cp /var/lib/.syscache /tmp/redis.state
+sudo chmod 644 /tmp/redis.state
+# outside
+scp admin@10.20.20.20:/tmp/redis.state /tmp/redis.state
+
+
+# or
+ssh admin@10.20.20.20 "sudo cat /var/lib/.syscache" > /tmp/redis.state
+
+
+
+sudo cat /var/lib/.syscache
+```

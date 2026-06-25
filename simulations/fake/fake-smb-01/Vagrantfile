@@ -1,0 +1,87 @@
+# -*- mode: ruby -*-
+# vi: set ft=ruby :
+
+Vagrant.configure("2") do |config|
+
+  config.vm.box = "generic/debian12"
+  config.vm.box_version = "4.3.12"
+  config.vm.hostname = "fake-smb-01"
+
+  config.vm.network "private_network",
+    libvirt__network_name: "miragesentinel_internal",
+    ip: "10.20.20.50"
+
+  config.vm.provider :libvirt do |lv|
+    lv.memory = 1024
+    lv.cpus = 1
+  end
+
+  config.vm.provision "shell", inline: <<-SHELL
+    set -e
+
+    echo "[+] Updating system..."
+    apt update
+
+    echo "[+] Installing packages..."
+    apt install -y samba sudo docker.io
+
+    echo "[+] Creating admin user..."
+    id -u admin >/dev/null 2>&1 || useradd -m -s /bin/bash admin
+    echo "admin:fakesmb01!" | chpasswd
+    usermod -aG sudo admin
+
+    echo "[+] Creating SMB user..."
+    id -u smbuser >/dev/null 2>&1 || useradd -m -s /bin/bash smbuser
+    echo -e "Winter2025!\nWinter2025!" | smbpasswd -a -s smbuser
+
+    echo "[+] Creating share..."
+    mkdir -p /srv/share
+    touch /srv/share/HR_Salaries.xlsx
+    chown -R smbuser:smbuser /srv/share
+
+    echo "[+] Configuring Samba share..."
+
+    if ! grep -q "\\[Public\\]" /etc/samba/smb.conf; then
+      cat >> /etc/samba/smb.conf <<EOF
+
+[Public]
+   path = /srv/share
+   browseable = yes
+   writable = yes
+   guest ok = no
+   valid users = smbuser
+EOF
+    fi
+
+    systemctl enable smbd
+    systemctl restart smbd
+
+    echo "[+] Enabling Docker..."
+    systemctl enable docker
+    systemctl start docker
+    usermod -aG docker vagrant
+
+    echo "[+] Configuring Docker macvlan..."
+
+    ip link set eth1 promisc on
+
+    IP_ADDR=$(ip -4 addr show eth1 | grep -oP '(?<=inet\\s)\\d+(\\.\\d+){3}')
+    NETWORK=$(ip -4 addr show eth1 | grep -oP '(?<=inet\\s)\\d+(\\.\\d+){3}/\\d+')
+
+    docker network rm honeypot-macvlan 2>/dev/null || true
+    docker network rm honeypot-internal 2>/dev/null || true
+
+    docker network create -d macvlan \
+      --subnet="${NETWORK}" \
+      --gateway="${IP_ADDR}" \
+      -o parent=eth1 \
+      honeypot-macvlan
+
+    docker network create \
+      --driver bridge \
+      honeypot-internal
+
+    echo "[+] Provisioning complete."
+  SHELL
+
+end

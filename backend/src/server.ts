@@ -1,0 +1,196 @@
+/**
+ * MirageSentinel_Deception_Lab™
+ * Copyright © 2026 Ayush Anand. All rights reserved.
+ * Unauthorized rebranding, redistribution, or republication is prohibited.
+ */
+import express from 'express';
+import cors from 'cors';
+import helmet from 'helmet';
+import morgan from 'morgan';
+import compression from 'compression';
+import rateLimit from 'express-rate-limit';
+import dotenv from 'dotenv';
+import mongoose from 'mongoose';
+import { createServer } from 'http';
+import cron from 'node-cron';
+
+import { errorHandler } from './middleware/errorHandler';
+import { logger } from './utils/logger';
+import { CRDTSyncService } from './services/CRDTSyncService';
+import { WebSocketHandler } from './websocket/WebSocketHandler';
+import { RealSimulationService } from './services/RealSimulationService';
+import { MitreSyncService } from './services/MitreSyncService';
+import { seedDatabase } from './utils/seedData';
+import dashboardRoutes from './routes/dashboard';
+import simulationRoutes from './routes/simulation';
+import decoyRoutes from './routes/decoy';
+import vmRoutes, { setVmRoutesWebSocket } from './routes/vms';
+import rlRoutes, { setRLRoutesWebSocket } from './routes/rl';
+import { Attacker } from './models';
+import { rlArtifactsService } from './services/RLArtifactsService';
+
+dotenv.config();
+
+const app = express();
+const server = createServer(app);
+
+const PORT = Number(process.env.PORT || 3001);
+const MONGODB_URI = process.env.MONGODB_URI || process.env.DATABASE_URL || 'mongodb://localhost:27017/miragesentinel_deception';
+const isSimulationMode = process.env.SIMULATION_MODE === 'true';
+const corsOrigins = process.env.CORS_ORIGINS
+  ? process.env.CORS_ORIGINS.split(',').map(origin => origin.trim()).filter(Boolean)
+  : ['http://localhost:3000', 'http://localhost:5173'];
+
+cron.schedule('0 3 * * *', async () => {
+  logger.info('[Scheduler] Starting daily MITRE sync...');
+  const syncService = new MitreSyncService();
+  await syncService.sync();
+});
+
+app.use(helmet({
+  contentSecurityPolicy: false,
+  crossOriginEmbedderPolicy: false
+}));
+
+app.use(cors({
+  origin: corsOrigins,
+  credentials: true
+}));
+
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 1000,
+  message: 'Too many requests from this IP',
+  standardHeaders: true,
+  legacyHeaders: false
+});
+app.use(limiter);
+
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true }));
+app.use(morgan('combined', { stream: { write: msg => logger.info(msg.trim()) } }));
+app.use(compression());
+
+const crdtSync = new CRDTSyncService();
+const simulationService = new RealSimulationService();
+const wsHandler = new WebSocketHandler(server, crdtSync, simulationService);
+setVmRoutesWebSocket(wsHandler);
+
+// Seed demo artifacts so "Live Actuation Artifacts" panel has content on first load
+rlArtifactsService.seedDemoArtifacts();
+
+app.use('/api/dashboard', dashboardRoutes);
+app.use('/api/simulation', simulationRoutes);
+app.use('/api/decoy', decoyRoutes);
+app.use('/api/vms', vmRoutes);
+app.use('/api/rl', rlRoutes);
+
+// Wire WebSocket handler to RL routes so decisions can be broadcast live
+setRLRoutesWebSocket(wsHandler);
+
+app.get('/health', (_req, res) => {
+  res.json({
+    status: 'healthy',
+    timestamp: new Date().toISOString(),
+    uptime: process.uptime(),
+    websocketClients: wsHandler.getClientCount(),
+    mongodb: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected'
+  });
+});
+
+app.get('/api/attackers/summary', async (_req, res) => {
+  try {
+    const attackers = await Attacker.find().sort({ lastSeen: -1 }).limit(100).lean();
+
+    res.json({
+      total: attackers.length,
+      critical: attackers.filter(a => a.riskLevel === 'Critical').length,
+      high: attackers.filter(a => a.riskLevel === 'High').length,
+      medium: attackers.filter(a => a.riskLevel === 'Medium').length,
+      low: attackers.filter(a => a.riskLevel === 'Low').length,
+      attackers: attackers.map(a => ({
+        id: a.attackerId,
+        ip: a.ipAddress,
+        riskLevel: a.riskLevel,
+        firstSeen: a.firstSeen,
+        lastSeen: a.lastSeen,
+        dwellTime: a.dwellTime,
+        status: a.status
+      }))
+    });
+  } catch (error) {
+    logger.error('Failed to fetch attacker summary:', error);
+    res.status(500).json({ error: 'Failed to fetch attacker data' });
+  }
+});
+
+app.get('/', (_req, res) => {
+  res.json({
+    name: 'MirageSentinel_Deception_Lab API',
+    version: '1.0.0',
+    endpoints: {
+      dashboard: '/api/dashboard',
+      vms: '/api/vms',
+      attackers: '/api/attackers/summary',
+      health: '/health',
+      websocket: `ws://localhost:${PORT}/ws`
+    }
+  });
+});
+
+app.use(errorHandler);
+
+async function start() {
+  try {
+    await mongoose.connect(MONGODB_URI);
+    logger.info('Connected to MongoDB');
+
+    if (isSimulationMode) {
+      await seedDatabase();
+    }
+
+    server.listen(PORT, () => {
+      logger.info(`MirageSentinel Dashboard API running on http://localhost:${PORT}`);
+      logger.info(`WebSocket endpoint: ws://localhost:${PORT}/ws`);
+
+      const syncInterval = parseInt(process.env.CRDT_SYNC_INTERVAL || '10000', 10);
+      crdtSync.startSyncLoop(syncInterval);
+    });
+  } catch (error) {
+    logger.error('Failed to start server:', error);
+    process.exit(1);
+  }
+}
+
+const gracefulShutdown = async (signal: string) => {
+  logger.info(`${signal} received, shutting down gracefully`);
+  crdtSync.stopSyncLoop();
+
+  server.close(async () => {
+    logger.info('HTTP server closed');
+
+    try {
+      await Promise.race([
+        mongoose.connection.close(),
+        new Promise((_, reject) =>
+          setTimeout(() => reject(new Error('MongoDB close timeout')), 5000)
+        )
+      ]);
+      logger.info('MongoDB connection closed');
+      process.exit(0);
+    } catch (err) {
+      logger.error('Error closing MongoDB connection:', err);
+      process.exit(1);
+    }
+  });
+
+  setTimeout(() => {
+    logger.error('Could not close connections in time, forcefully exiting');
+    process.exit(1);
+  }, 10000);
+};
+
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+
+void start();
