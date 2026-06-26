@@ -2,23 +2,19 @@
 const serverApiUrl = process.env.NEXT_PUBLIC_API_URL || process.env.BACKEND_URL || 'http://backend:3001';
 
 const nextConfig = {
-  output: 'standalone',
+  reactStrictMode: true,
+
   async rewrites() {
+    const apiUrl =
+      process.env.NEXT_PUBLIC_API_URL || "http://localhost:5000";
+
     return [
       {
-        source: '/api/:path*',
-        destination: `${serverApiUrl}/api/:path*`,
-      },
-      {
-        source: '/health',
-        destination: `${serverApiUrl}/health`,
-      },
-      {
-        source: '/ws',
-        destination: `${serverApiUrl.replace(/^http/, 'ws')}/ws`,
+        source: "/api/:path*",
+        destination: `${apiUrl}/api/:path*`,
       },
     ];
   },
 };
 
-export default nextConfig;
+module.exports = nextConfig;
